@@ -1,0 +1,400 @@
+openapi: 3.0.3
+info:
+  title: Oscar SLA Monitoring
+  version: 1.0.0
+  description: >
+    Регистрация и обработка IT-инцидентов. Инцидент — Job.
+    Ошибка любого ответа имеет вид error.code, error.message, error.details.
+servers:
+  - url: http://localhost:8080
+paths:
+  /jobs:
+    post:
+      operationId: createJob
+      summary: Создать инцидент
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateJob"
+      responses:
+        "201":
+          description: Инцидент создан в состоянии OPEN
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "200":
+          description: >
+            Тот же Idempotency-Key и то же тело возвращают прежний Job.
+            Тот же source_event_id тоже возвращает прежний Job, даже если
+            Idempotency-Key новый. Второй Job не создаётся.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          description: Нет Idempotency-Key или тело не JSON нужной формы
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                missingKey:
+                  value:
+                    error:
+                      code: missing_idempotency_key
+                      message: Idempotency-Key is required
+                      details: {}
+                invalidParams:
+                  value:
+                    error:
+                      code: invalid_params
+                      message: title is required
+                      details:
+                        field: title
+        "409":
+          description: >
+            Тот же Idempotency-Key, но другое тело. Новый Job не создаётся.
+            Совпадение source_event_id этим кодом не отвечается: оно даёт 200.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: idempotency_conflict
+                  message: This key was already used with a different body
+                  details: {}
+        "413":
+          description: Тело больше 64 КБ либо поле длиннее лимита. Job не создаётся.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: payload_too_large
+                  message: description exceeds 10000 characters
+                  details:
+                    field: description
+  /jobs/{id}:
+    get:
+      operationId: getJob
+      summary: Получить инцидент
+      description: >
+        Сервис одной организации. Неизвестный id отвечает 404 job_not_found
+        без лишних полей. Отдельного чужого контура нет, см. ADR 0001.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: Карточка инцидента
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          description: Инцидент не найден
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: job_not_found
+                  message: Job was not found
+                  details: {}
+  /jobs/{id}/operations:
+    post:
+      operationId: runOperation
+      summary: Назначение, переход, смена приоритета или эскалация
+      description: >
+        assign требует params.assignee_id. Успех из OPEN или ESCALATED
+        переводит Job в IN_PROGRESS.
+        transition требует params.to. Переход в RESOLVED дополнительно
+        требует params.resolution, иначе 422 и details.field равен resolution.
+        change_priority требует params.priority. Сроки SLA пересчитываются
+        в той же записи, прежние сроки остаются в истории.
+        escalate требует params.reason: reaction_sla_breached или
+        resolution_sla_breached. Повтор той же причины возвращает 200,
+        прежний Job и не ставит второе уведомление.
+        assign и escalate выполняет ITool. transition и change_priority
+        выполняет сценарий инцидента, не Tool.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OperationRequest"
+      responses:
+        "200":
+          description: Операция выполнена, возвращается актуальное состояние Job
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          description: Имени операции нет в контракте. Состояние Job не меняется.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: unknown_operation
+                  message: Operation is not supported
+                  details:
+                    field: operation
+        "404":
+          description: Инцидент не найден
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: job_not_found
+                  message: Job was not found
+                  details: {}
+        "409":
+          description: Запрещённый переход или конфликт назначения. Состояние не меняется.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                transition:
+                  value:
+                    error:
+                      code: invalid_transition
+                      message: Transition is not allowed
+                      details:
+                        from: CLOSED
+                        to: OPEN
+                assignment:
+                  value:
+                    error:
+                      code: assignment_conflict
+                      message: Assignee is already saved
+                      details:
+                        field: assignee_id
+        "422":
+          description: Форма запроса верна, доменное правило отвергло значение. Состояние не меняется.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                assignee:
+                  value:
+                    error:
+                      code: invalid_params
+                      message: Assignee is inactive
+                      details:
+                        field: assignee_id
+                resolution:
+                  value:
+                    error:
+                      code: invalid_params
+                      message: resolution is required
+                      details:
+                        field: resolution
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 200
+    JobId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  schemas:
+    CreateJob:
+      type: object
+      additionalProperties: false
+      required: [title, description, category, priority]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          minLength: 1
+          maxLength: 10000
+        category:
+          type: string
+          minLength: 1
+          maxLength: 100
+        priority:
+          type: string
+          enum: [low, medium, high, critical]
+        service:
+          type: string
+          maxLength: 200
+        source_event_id:
+          type: string
+          maxLength: 200
+          description: Повтор того же значения возвращает уже созданный Job со статусом 200.
+    OperationRequest:
+      oneOf:
+        - $ref: "#/components/schemas/AssignOperation"
+        - $ref: "#/components/schemas/TransitionOperation"
+        - $ref: "#/components/schemas/ChangePriorityOperation"
+        - $ref: "#/components/schemas/EscalateOperation"
+    AssignOperation:
+      type: object
+      additionalProperties: false
+      required: [operation, params]
+      properties:
+        operation:
+          type: string
+          enum: [assign]
+        params:
+          type: object
+          additionalProperties: false
+          required: [assignee_id]
+          properties:
+            assignee_id:
+              type: string
+              minLength: 1
+    TransitionOperation:
+      type: object
+      additionalProperties: false
+      required: [operation, params]
+      properties:
+        operation:
+          type: string
+          enum: [transition]
+        params:
+          type: object
+          additionalProperties: false
+          required: [to]
+          properties:
+            to:
+              type: string
+              enum: [OPEN, IN_PROGRESS, ESCALATED, RESOLVED, CLOSED, CANCELLED]
+            resolution:
+              type: string
+              minLength: 1
+              maxLength: 10000
+              description: Обязательно, когда to равен RESOLVED.
+    ChangePriorityOperation:
+      type: object
+      additionalProperties: false
+      required: [operation, params]
+      properties:
+        operation:
+          type: string
+          enum: [change_priority]
+        params:
+          type: object
+          additionalProperties: false
+          required: [priority]
+          properties:
+            priority:
+              type: string
+              enum: [low, medium, high, critical]
+    EscalateOperation:
+      type: object
+      additionalProperties: false
+      required: [operation, params]
+      properties:
+        operation:
+          type: string
+          enum: [escalate]
+        params:
+          type: object
+          additionalProperties: false
+          required: [reason]
+          properties:
+            reason:
+              type: string
+              enum: [reaction_sla_breached, resolution_sla_breached]
+    Job:
+      type: object
+      required: [id, title, state, priority, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        description:
+          type: string
+        category:
+          type: string
+        priority:
+          type: string
+          enum: [low, medium, high, critical]
+        service:
+          type: string
+          nullable: true
+        assignee_id:
+          type: string
+          nullable: true
+        state:
+          type: string
+          enum: [OPEN, IN_PROGRESS, ESCALATED, RESOLVED, CLOSED, CANCELLED]
+        resolution:
+          type: string
+          nullable: true
+        reaction_due_at:
+          type: string
+          format: date-time
+        resolution_due_at:
+          type: string
+          format: date-time
+        source_event_id:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, details]
+          properties:
+            code:
+              type: string
+              enum:
+                - missing_idempotency_key
+                - invalid_params
+                - idempotency_conflict
+                - payload_too_large
+                - job_not_found
+                - unknown_operation
+                - invalid_transition
+                - assignment_conflict
+            message:
+              type: string
+            details:
+              type: object
+              properties:
+                field:
+                  type: string
+                from:
+                  type: string
+                to:
+                  type: string
